@@ -10,7 +10,6 @@
     }
   },
   "env": {
-    "NEXT_PUBLIC_API_URL": "@next_public_api_url",
     "NEXT_PUBLIC_APP_NAME": "心のログ",
     "NEXT_PUBLIC_SELECT_AI_SERVICE": "openai",
     "NEXT_PUBLIC_SELECT_AI_MODEL": "gpt-4o-mini",
