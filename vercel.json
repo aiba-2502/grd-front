@@ -1,0 +1,39 @@
+{
+  "framework": "nextjs",
+  "buildCommand": "npm run build",
+  "devCommand": "npm run dev",
+  "installCommand": "npm install",
+  "outputDirectory": ".next",
+  "functions": {
+    "app/**/*.{ts,tsx}": {
+      "maxDuration": 30
+    }
+  },
+  "env": {
+    "NEXT_PUBLIC_API_URL": "@next_public_api_url",
+    "NEXT_PUBLIC_APP_NAME": "心のログ",
+    "NEXT_PUBLIC_SELECT_AI_SERVICE": "openai",
+    "NEXT_PUBLIC_SELECT_AI_MODEL": "gpt-4o-mini",
+    "NEXT_PUBLIC_TEMPERATURE": "0.5",
+    "NEXT_PUBLIC_MAX_TOKENS": "300",
+    "NEXT_PUBLIC_MAX_PAST_MESSAGES": "10",
+    "NEXT_PUBLIC_LIVE2D_MODEL_PATH": "/live2d/hiyori/hiyori_free.model3.json",
+    "NEXT_PUBLIC_SHOW_LIVE2D": "true",
+    "NEXT_PUBLIC_DEBUG_MODE": "false",
+    "NEXT_PUBLIC_VOICE_VOLUME": "0.8",
+    "NEXT_PUBLIC_VOICE_PLAYBACK_RATE": "1.0",
+    "NEXT_PUBLIC_SESSION_TIMEOUT": "60",
+    "NEXT_PUBLIC_AUTO_SAVE_INTERVAL": "30"
+  },
+  "headers": [
+    {
+      "source": "/api/:path*",
+      "headers": [
+        { "key": "Access-Control-Allow-Credentials", "value": "true" },
+        { "key": "Access-Control-Allow-Origin", "value": "@cors_allowed_origin" },
+        { "key": "Access-Control-Allow-Methods", "value": "GET,OPTIONS,PATCH,DELETE,POST,PUT" },
+        { "key": "Access-Control-Allow-Headers", "value": "X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version" }
+      ]
+    }
+  ]
+}

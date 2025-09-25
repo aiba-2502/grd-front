@@ -1,0 +1,51 @@
+{
+  "name": "frontend",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev --turbopack --hostname 0.0.0.0",
+    "dev:webpack": "next dev --hostname 0.0.0.0",
+    "dev:precompile": "sh scripts/dev-with-precompile.sh",
+    "build": "next build --turbopack",
+    "build:webpack": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "type-check": "tsc --noEmit",
+    "format": "prettier --write \"**/*.{js,jsx,ts,tsx,md,json,css}\"",
+    "format:check": "prettier --check \"**/*.{js,jsx,ts,tsx,md,json,css}\"",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage"
+  },
+  "dependencies": {
+    "@heroicons/react": "^2.2.0",
+    "@types/dompurify": "^3.0.5",
+    "axios": "^1.11.0",
+    "base64-arraybuffer": "^1.0.2",
+    "dompurify": "^3.2.6",
+    "next": "15.5.0",
+    "react": "19.1.0",
+    "react-dom": "19.1.0",
+    "uuid": "^11.1.0",
+    "wav-encoder": "^1.3.0",
+    "zustand": "^5.0.8"
+  },
+  "devDependencies": {
+    "@eslint/eslintrc": "^3",
+    "@jest/globals": "^30.1.2",
+    "@tailwindcss/postcss": "^4",
+    "@types/jest": "^30.0.0",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@types/uuid": "^10.0.0",
+    "critters": "^0.0.23",
+    "eslint": "^9",
+    "eslint-config-next": "15.5.0",
+    "jest": "^30.1.3",
+    "prettier": "^3.6.2",
+    "tailwindcss": "^4",
+    "ts-jest": "^29.4.3",
+    "typescript": "^5.9.2"
+  }
+}

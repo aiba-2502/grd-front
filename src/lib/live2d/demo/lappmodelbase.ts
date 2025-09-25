@@ -1,0 +1,1316 @@
+/**
+ * Copyright(c) Live2D Inc. All rights reserved.
+ *
+ * Use of this source code is governed by the Live2D Open Software license
+ * that can be found at https://www.live2d.com/eula/live2d-open-software-license-agreement_en.html.
+ */
+
+import { CubismDefaultParameterId } from '../framework/cubismdefaultparameterid';
+import { CubismModelSettingJson } from '../framework/cubismmodelsettingjson';
+import { logger } from '@/utils/logger';
+import {
+  BreathParameterData,
+  CubismBreath
+} from '../framework/effect/cubismbreath';
+import { CubismEyeBlink } from '../framework/effect/cubismeyeblink';
+import { ICubismModelSetting } from '../framework/icubismmodelsetting';
+import { CubismIdHandle } from '../framework/id/cubismid';
+import { CubismFramework } from '../framework/live2dcubismframework';
+import { CubismMatrix44 } from '../framework/math/cubismmatrix44';
+import { CubismUserModel } from '../framework/model/cubismusermodel';
+import {
+  ACubismMotion,
+  BeganMotionCallback,
+  FinishedMotionCallback
+} from '../framework/motion/acubismmotion';
+import { CubismMotion } from '../framework/motion/cubismmotion';
+import {
+  CubismMotionQueueEntryHandle,
+  InvalidMotionQueueEntryHandleValue
+} from '../framework/motion/cubismmotionqueuemanager';
+import { csmMap } from '../framework/type/csmmap';
+import { csmRect } from '../framework/type/csmrectf';
+import { csmString } from '../framework/type/csmstring';
+import { csmVector } from '../framework/type/csmvector';
+import {
+  CSM_ASSERT,
+  CubismLogError,
+  CubismLogInfo
+} from '../framework/utils/cubismdebug';
+
+import * as LAppDefine from './lappdefine';
+import { LAppPal } from './lapppal';
+import { TextureInfo } from './lapptexturemanager';
+import { LAppWavFileHandler } from './lappwavfilehandler';
+import { CubismMoc } from '../framework/model/cubismmoc';
+import { LAppDelegate } from './lappdelegate';
+import { LAppSubdelegate } from './lappsubdelegate';
+import { NaturalMotionController } from '../NaturalMotionController';
+
+export enum LoadStep {
+  LoadAssets,
+  LoadModel,
+  WaitLoadModel,
+  LoadExpression,
+  WaitLoadExpression,
+  LoadPhysics,
+  WaitLoadPhysics,
+  LoadPose,
+  WaitLoadPose,
+  SetupEyeBlink,
+  SetupBreath,
+  LoadUserData,
+  WaitLoadUserData,
+  SetupEyeBlinkIds,
+  SetupLipSyncIds,
+  SetupLayout,
+  LoadMotion,
+  WaitLoadMotion,
+  CompleteInitialize,
+  CompleteSetupModel,
+  LoadTexture,
+  WaitLoadTexture,
+  CompleteSetup
+}
+
+/**
+ * ユーザーが実際に使用するモデルの実装クラス<br>
+ * モデル生成、機能コンポーネント生成、更新処理とレンダリングの呼び出しを行う。
+ */
+export class LAppModelBase extends CubismUserModel {
+  /**
+   * model3.jsonが置かれたディレクトリとファイルパスからモデルを生成する
+   * @param dir
+   * @param fileName
+   */
+  public loadAssets(dir: string, fileName: string): void {
+    // 既存のロード処理をキャンセル
+    this.cancelLoading();
+
+    // Phase 3: Reset gaze to center on model load
+    this.resetMousePosition();
+    this._dragX = 0;
+    this._dragY = 0;
+    this._dragSpeedX = 0;
+    this._dragSpeedY = 0;
+    if (this._naturalMotionController) {
+      this._naturalMotionController.onModelLoad();
+    }
+
+    this._modelHomeDir = dir;
+    this._abortController = new AbortController();
+
+    fetch(`${this._modelHomeDir}${fileName}`, { signal: this._abortController.signal })
+      .then(response => {
+        // subdelegateがnullになっていないかチェック
+        if (!this._subdelegate) {
+          throw new Error('Subdelegate is null, cancelling model load');
+        }
+        return response.arrayBuffer();
+      })
+      .then(arrayBuffer => {
+        // subdelegateがnullになっていないかチェック
+        if (!this._subdelegate) {
+          throw new Error('Subdelegate is null, cancelling model setup');
+        }
+        const setting: ICubismModelSetting = new CubismModelSettingJson(
+          arrayBuffer,
+          arrayBuffer.byteLength
+        );
+
+        // ステートを更新
+        this._state = LoadStep.LoadModel;
+
+        // 結果を保存
+        this.setupModel(setting);
+      })
+      .catch(error => {
+        // AbortErrorの場合はログを出さない
+        if (error.name !== 'AbortError') {
+          CubismLogError(`Failed to load file ${this._modelHomeDir}${fileName}: ${error.message}`);
+        }
+      });
+  }
+
+  /**
+   * model3.jsonからモデルを生成する。
+   * model3.jsonの記述に従ってモデル生成、モーション、物理演算などのコンポーネント生成を行う。
+   *
+   * @param setting ICubismModelSettingのインスタンス
+   */
+  private setupModel(setting: ICubismModelSetting): void {
+    this._updating = true;
+    this._initialized = false;
+
+    this._modelSetting = setting;
+
+    // CubismModel
+    if (this._modelSetting.getModelFileName() != '') {
+      const modelFileName = this._modelSetting.getModelFileName();
+
+      // AbortControllerがない場合はスキップ
+      if (!this._abortController) {
+        logger.warn('AbortController not available, skipping model load');
+        return;
+      }
+
+      fetch(`${this._modelHomeDir}${modelFileName}`, { signal: this._abortController.signal })
+        .then(response => {
+          // subdelegateがnullになっていないかチェック
+          if (!this._subdelegate) {
+            throw new Error('Subdelegate is null, cancelling model file load');
+          }
+          if (response.ok) {
+            return response.arrayBuffer();
+          } else if (response.status >= 400) {
+            CubismLogError(
+              `Failed to load file ${this._modelHomeDir}${modelFileName}`
+            );
+            return new ArrayBuffer(0);
+          }
+        })
+        .then(arrayBuffer => {
+          this.loadModel(arrayBuffer, this._mocConsistency);
+          this._state = LoadStep.LoadExpression;
+
+          // callback
+          loadCubismExpression();
+        });
+
+      this._state = LoadStep.WaitLoadModel;
+    } else {
+      LAppPal.printMessage('Model data does not exist.');
+    }
+
+    // Expression
+    const loadCubismExpression = (): void => {
+      if (this._modelSetting.getExpressionCount() > 0) {
+        const count: number = this._modelSetting.getExpressionCount();
+
+        for (let i = 0; i < count; i++) {
+          const expressionName = this._modelSetting.getExpressionName(i);
+          const expressionFileName =
+            this._modelSetting.getExpressionFileName(i);
+
+          // AbortControllerがない場合はスキップ
+          if (!this._abortController) {
+            return;
+          }
+
+          fetch(`${this._modelHomeDir}${expressionFileName}`, { signal: this._abortController.signal })
+            .then(response => {
+              // subdelegateがnullになっていないかチェック
+              if (!this._subdelegate) {
+                throw new Error('Subdelegate is null, cancelling expression load');
+              }
+              if (response.ok) {
+                return response.arrayBuffer();
+              } else if (response.status >= 400) {
+                CubismLogError(
+                  `Failed to load file ${this._modelHomeDir}${expressionFileName}`
+                );
+                // ファイルが存在しなくてもresponseはnullを返却しないため、空のArrayBufferで対応する
+                return new ArrayBuffer(0);
+              }
+            })
+            .then(arrayBuffer => {
+              const motion: ACubismMotion = this.loadExpression(
+                arrayBuffer,
+                arrayBuffer.byteLength,
+                expressionName
+              );
+
+              if (this._expressions.getValue(expressionName) != null) {
+                ACubismMotion.delete(
+                  this._expressions.getValue(expressionName)
+                );
+                this._expressions.setValue(expressionName, null);
+              }
+
+              this._expressions.setValue(expressionName, motion);
+
+              this._expressionCount++;
+
+              if (this._expressionCount >= count) {
+                this._state = LoadStep.LoadPhysics;
+
+                // callback
+                loadCubismPhysics();
+              }
+            });
+        }
+        this._state = LoadStep.WaitLoadExpression;
+      } else {
+        this._state = LoadStep.LoadPhysics;
+
+        // callback
+        loadCubismPhysics();
+      }
+    };
+
+    // Physics
+    const loadCubismPhysics = (): void => {
+      if (this._modelSetting.getPhysicsFileName() != '') {
+        const physicsFileName = this._modelSetting.getPhysicsFileName();
+
+        // AbortControllerがない場合はスキップ
+        if (!this._abortController) {
+          return;
+        }
+
+        fetch(`${this._modelHomeDir}${physicsFileName}`, { signal: this._abortController.signal })
+          .then(response => {
+            // subdelegateがnullになっていないかチェック
+            if (!this._subdelegate) {
+              throw new Error('Subdelegate is null, cancelling physics load');
+            }
+            if (response.ok) {
+              return response.arrayBuffer();
+            } else if (response.status >= 400) {
+              CubismLogError(
+                `Failed to load file ${this._modelHomeDir}${physicsFileName}`
+              );
+              return new ArrayBuffer(0);
+            }
+          })
+          .then(arrayBuffer => {
+            this.loadPhysics(arrayBuffer, arrayBuffer.byteLength);
+
+            this._state = LoadStep.LoadPose;
+
+            // callback
+            loadCubismPose();
+          });
+        this._state = LoadStep.WaitLoadPhysics;
+      } else {
+        this._state = LoadStep.LoadPose;
+
+        // callback
+        loadCubismPose();
+      }
+    };
+
+    // Pose
+    const loadCubismPose = (): void => {
+      if (this._modelSetting.getPoseFileName() != '') {
+        const poseFileName = this._modelSetting.getPoseFileName();
+
+        // AbortControllerがない場合はスキップ
+        if (!this._abortController) {
+          return;
+        }
+
+        fetch(`${this._modelHomeDir}${poseFileName}`, { signal: this._abortController.signal })
+          .then(response => {
+            // subdelegateがnullになっていないかチェック
+            if (!this._subdelegate) {
+              throw new Error('Subdelegate is null, cancelling pose load');
+            }
+            if (response.ok) {
+              return response.arrayBuffer();
+            } else if (response.status >= 400) {
+              CubismLogError(
+                `Failed to load file ${this._modelHomeDir}${poseFileName}`
+              );
+              return new ArrayBuffer(0);
+            }
+          })
+          .then(arrayBuffer => {
+            this.loadPose(arrayBuffer, arrayBuffer.byteLength);
+
+            this._state = LoadStep.SetupEyeBlink;
+
+            // callback
+            setupEyeBlink();
+          });
+        this._state = LoadStep.WaitLoadPose;
+      } else {
+        this._state = LoadStep.SetupEyeBlink;
+
+        // callback
+        setupEyeBlink();
+      }
+    };
+
+    // EyeBlink
+    const setupEyeBlink = (): void => {
+      if (this._modelSetting.getEyeBlinkParameterCount() > 0) {
+        this._eyeBlink = CubismEyeBlink.create(this._modelSetting);
+        this._state = LoadStep.SetupBreath;
+      }
+
+      // callback
+      setupBreath();
+    };
+
+    // Breath
+    const setupBreath = (): void => {
+      this._breath = CubismBreath.create();
+
+      const breathParameters: csmVector<BreathParameterData> = new csmVector();
+      // 呼吸パラメータを控えめに調整（落ち着いた動き）
+      breathParameters.pushBack(
+        new BreathParameterData(this._idParamAngleX, 0.0, 3.0, 6.5345, 0.5)
+      );
+      breathParameters.pushBack(
+        new BreathParameterData(this._idParamAngleY, 0.0, 2.0, 3.5345, 0.5)
+      );
+      breathParameters.pushBack(
+        new BreathParameterData(this._idParamAngleZ, 0.0, 2.5, 5.5345, 0.5)
+      );
+      breathParameters.pushBack(
+        new BreathParameterData(this._idParamBodyAngleX, 0.0, 1.0, 15.5345, 0.5)
+      );
+      breathParameters.pushBack(
+        new BreathParameterData(this._idParamBodyAngleY, 0.0, 0.5, 8.5345, 0.5)
+      );
+      breathParameters.pushBack(
+        new BreathParameterData(
+          CubismFramework.getIdManager().getId(
+            CubismDefaultParameterId.ParamBreath
+          ),
+          0.5,
+          0.5,
+          3.2345,
+          1
+        )
+      );
+
+      this._breath.setParameters(breathParameters);
+      this._state = LoadStep.LoadUserData;
+
+      // callback
+      loadUserData();
+    };
+
+    // UserData
+    const loadUserData = (): void => {
+      if (this._modelSetting.getUserDataFile() != '') {
+        const userDataFile = this._modelSetting.getUserDataFile();
+
+        // AbortControllerがない場合はスキップ
+        if (!this._abortController) {
+          return;
+        }
+
+        fetch(`${this._modelHomeDir}${userDataFile}`, { signal: this._abortController.signal })
+          .then(response => {
+            // subdelegateがnullになっていないかチェック
+            if (!this._subdelegate) {
+              throw new Error('Subdelegate is null, cancelling user data load');
+            }
+            if (response.ok) {
+              return response.arrayBuffer();
+            } else if (response.status >= 400) {
+              CubismLogError(
+                `Failed to load file ${this._modelHomeDir}${userDataFile}`
+              );
+              return new ArrayBuffer(0);
+            }
+          })
+          .then(arrayBuffer => {
+            this.loadUserData(arrayBuffer, arrayBuffer.byteLength);
+
+            this._state = LoadStep.SetupEyeBlinkIds;
+
+            // callback
+            setupEyeBlinkIds();
+          });
+
+        this._state = LoadStep.WaitLoadUserData;
+      } else {
+        this._state = LoadStep.SetupEyeBlinkIds;
+
+        // callback
+        setupEyeBlinkIds();
+      }
+    };
+
+    // EyeBlinkIds
+    const setupEyeBlinkIds = (): void => {
+      const eyeBlinkIdCount: number =
+        this._modelSetting.getEyeBlinkParameterCount();
+
+      for (let i = 0; i < eyeBlinkIdCount; ++i) {
+        this._eyeBlinkIds.pushBack(
+          this._modelSetting.getEyeBlinkParameterId(i)
+        );
+      }
+
+      this._state = LoadStep.SetupLipSyncIds;
+
+      // callback
+      setupLipSyncIds();
+    };
+
+    // LipSyncIds
+    const setupLipSyncIds = (): void => {
+      const lipSyncIdCount = this._modelSetting.getLipSyncParameterCount();
+
+      for (let i = 0; i < lipSyncIdCount; ++i) {
+        this._lipSyncIds.pushBack(this._modelSetting.getLipSyncParameterId(i));
+      }
+      this._state = LoadStep.SetupLayout;
+
+      // callback
+      setupLayout();
+    };
+
+    // Layout
+    const setupLayout = (): void => {
+      const layout: csmMap<string, number> = new csmMap<string, number>();
+
+      if (this._modelSetting == null || this._modelMatrix == null) {
+        CubismLogError('Failed to setupLayout().');
+        return;
+      }
+
+      this._modelSetting.getLayoutMap(layout);
+      this._modelMatrix.setupFromLayout(layout);
+      this._state = LoadStep.LoadMotion;
+
+      // callback
+      loadCubismMotion();
+    };
+
+    // Motion
+    const loadCubismMotion = (): void => {
+      this._state = LoadStep.WaitLoadMotion;
+      this._model.saveParameters();
+      this._allMotionCount = 0;
+      this._motionCount = 0;
+      const group: string[] = [];
+
+      const motionGroupCount: number = this._modelSetting.getMotionGroupCount();
+
+      // モーションの総数を求める
+      for (let i = 0; i < motionGroupCount; i++) {
+        group[i] = this._modelSetting.getMotionGroupName(i);
+        this._allMotionCount += this._modelSetting.getMotionCount(group[i]);
+      }
+
+      // モーションの読み込み
+      for (let i = 0; i < motionGroupCount; i++) {
+        this.preLoadMotionGroup(group[i]);
+      }
+
+      // モーションがない場合
+      if (motionGroupCount == 0) {
+        this._state = LoadStep.LoadTexture;
+
+        // 全てのモーションを停止する
+        this._motionManager.stopAllMotions();
+
+        this._updating = false;
+        this._initialized = true;
+
+        this.createRenderer();
+        this.setupTextures();
+        if (this._subdelegate && this._subdelegate.getGlManager()) {
+          this.getRenderer().startUp(this._subdelegate.getGlManager().getGl());
+        } else {
+          logger.error('Subdelegate or GlManager not available for renderer startup');
+        }
+      }
+    };
+  }
+
+  /**
+   * テクスチャユニットにテクスチャをロードする
+   */
+  private setupTextures(): void {
+    // subdelegateが設定されていない場合は処理をスキップ
+    if (!this._subdelegate) {
+      logger.warn('setupTextures: subdelegate is not set');
+      return;
+    }
+
+    // iPhoneでのアルファ品質向上のためTypescriptではpremultipliedAlphaを採用
+    const usePremultiply = true;
+
+    if (this._state == LoadStep.LoadTexture) {
+      // テクスチャ読み込み用
+      const textureCount: number = this._modelSetting.getTextureCount();
+
+      for (
+        let modelTextureNumber = 0;
+        modelTextureNumber < textureCount;
+        modelTextureNumber++
+      ) {
+        // テクスチャ名が空文字だった場合はロード・バインド処理をスキップ
+        if (this._modelSetting.getTextureFileName(modelTextureNumber) == '') {
+          logger.log('getTextureFileName null');
+          continue;
+        }
+
+        // WebGLのテクスチャユニットにテクスチャをロードする
+        let texturePath =
+          this._modelSetting.getTextureFileName(modelTextureNumber);
+        texturePath = this._modelHomeDir + texturePath;
+
+        // ロード完了時に呼び出すコールバック関数
+        const onLoad = (textureInfo: TextureInfo): void => {
+          this.getRenderer().bindTexture(modelTextureNumber, textureInfo.id);
+
+          this._textureCount++;
+
+          if (this._textureCount >= textureCount) {
+            // ロード完了
+            this._state = LoadStep.CompleteSetup;
+          }
+        };
+
+        // 読み込み
+        if (this._subdelegate) {
+          const textureManager = this._subdelegate.getTextureManager();
+          if (textureManager) {
+            textureManager.createTextureFromPngFile(texturePath, usePremultiply, onLoad);
+            this.getRenderer().setIsPremultipliedAlpha(usePremultiply);
+          } else {
+            logger.error('TextureManager not available in subdelegate');
+            logger.log('Subdelegate exists but TextureManager is null');
+          }
+        } else {
+          logger.error('Subdelegate not set in LAppModel');
+        }
+      }
+
+      this._state = LoadStep.WaitLoadTexture;
+    }
+  }
+
+  /**
+   * レンダラを再構築する
+   */
+  public reloadRenderer(): void {
+    this.deleteRenderer();
+    this.createRenderer();
+    this.setupTextures();
+  }
+
+  /**
+   * 更新
+   */
+  public update(): void {
+    if (this._state != LoadStep.CompleteSetup) return;
+
+    const deltaTimeSeconds: number = LAppPal.getDeltaTime();
+    this._userTimeSeconds += deltaTimeSeconds;
+
+    this._dragManager.update(deltaTimeSeconds);
+    const targetDragX = this._dragManager.getX();
+    const targetDragY = this._dragManager.getY();
+
+    // Phase 2: Enhanced smoothing with acceleration-based motion
+    const deltaX = targetDragX - this._dragX;
+    const deltaY = targetDragY - this._dragY;
+
+    // Apply acceleration for more natural movement
+    if (Math.abs(deltaX) > 0.01) {
+      this._dragSpeedX = Math.min(0.15, this._dragSpeedX + 0.02);
+    } else {
+      this._dragSpeedX *= 0.95; // Decelerate when close to target
+    }
+
+    if (Math.abs(deltaY) > 0.01) {
+      this._dragSpeedY = Math.min(0.15, this._dragSpeedY + 0.02);
+    } else {
+      this._dragSpeedY *= 0.95; // Decelerate when close to target
+    }
+
+    // Apply smoothed motion with improved factor
+    const smoothingFactor = 0.08; // Increased from 0.05 for smoother motion
+    this._dragX += deltaX * this._dragSpeedX * smoothingFactor;
+    this._dragY += deltaY * this._dragSpeedY * smoothingFactor;
+
+    // Phase 4: Add idle micro-movements when not actively moving
+    if (Math.abs(deltaX) < 0.1 && Math.abs(deltaY) < 0.1) {
+      const time = Date.now() * 0.001;
+      const idleX = Math.sin(time * 0.5) * 0.02;
+      const idleY = Math.cos(time * 0.3) * 0.02;
+      this._dragX += idleX;
+      this._dragY += idleY;
+    }
+
+    // モーションによるパラメータ更新の有無
+    let motionUpdated = false;
+
+    //--------------------------------------------------------------------------
+    this._model.loadParameters(); // 前回セーブされた状態をロード
+    
+    // disableMotionsがtrueの場合はモーション更新をスキップ
+    if (!this._disableMotions) {
+      if (this._motionManager.isFinished()) {
+        // アイドルモーション機能を無効化（リップシンクに集中するため）
+        // モーションの再生がない場合でも、待機モーションは開始しない
+        // this.startRandomMotion(
+        //   LAppDefine.MotionGroupIdle,
+        //   LAppDefine.PriorityIdle
+        // );
+      } else {
+        motionUpdated = this._motionManager.updateMotion(
+          this._model,
+          deltaTimeSeconds
+        ); // モーションを更新
+      }
+    }
+    // saveParametersは最後に移動して、全てのパラメータ更新後に保存
+    //--------------------------------------------------------------------------
+
+    // Phase 4: Randomized blink timing for more natural appearance
+    // まばたき - チャット画面でもまばたきは有効にする
+    if (!motionUpdated) {
+      if (this._eyeBlink != null) {
+        const currentTime = Date.now();
+        // Randomize blink interval (2-6 seconds)
+        const blinkInterval = this._naturalMotionController.getNextBlinkInterval();
+
+        if (currentTime - this._lastBlinkTime > blinkInterval) {
+          this._eyeBlink.updateParameters(this._model, deltaTimeSeconds); // 目パチ
+          this._lastBlinkTime = currentTime;
+        }
+      }
+    }
+
+    if (this._expressionManager != null) {
+      this._expressionManager.updateMotion(this._model, deltaTimeSeconds); // 表情でパラメータ更新（相対変化）
+    }
+
+    // ドラッグによる変化（マウス追従）- これは維持
+    // 待機モーション中でもマウス追従を優先するため、パラメータ値を強制的に上書き
+    // 顔の向きの調整（控えめで自然な動きに調整）
+    const baseAngleX = this._model.getParameterValueById(this._idParamAngleX);
+    const baseAngleY = this._model.getParameterValueById(this._idParamAngleY);
+    const baseAngleZ = this._model.getParameterValueById(this._idParamAngleZ);
+    const baseBodyAngleX = this._model.getParameterValueById(this._idParamBodyAngleX);
+    const baseBodyAngleY = this._model.getParameterValueById(this._idParamBodyAngleY);
+    const baseBodyAngleZ = this._model.getParameterValueById(this._idParamBodyAngleZ);
+
+    // モーションの値に追従値を加算（落ち着いた動きに調整）
+    this._model.setParameterValueById(this._idParamAngleX, baseAngleX + this._dragX * 10);
+    this._model.setParameterValueById(this._idParamAngleY, baseAngleY + this._dragY * 10);
+    this._model.setParameterValueById(this._idParamAngleZ, baseAngleZ + this._dragX * this._dragY * -5);
+
+    // Phase 2: Enable body following with reduced ratio for subtle movement
+    // 体の追従を有効化（控えめに）
+    const bodyMotion = this._naturalMotionController.calculateBodyMotion(this._dragX, this._dragY);
+    this._model.setParameterValueById(this._idParamBodyAngleX, baseBodyAngleX + this._dragX * 3); // Reduced from 6 to 3
+    this._model.setParameterValueById(this._idParamBodyAngleY, baseBodyAngleY + this._dragY * 3); // Reduced from 6 to 3
+    this._model.setParameterValueById(this._idParamBodyAngleZ, baseBodyAngleZ + this._dragX * this._dragY * -1.5); // Reduced from -3 to -1.5
+
+    // 目の向きの調整（自然な視線移動）
+    if (LAppDefine.DebugLogEnable && (this._dragX !== 0 || this._dragY !== 0)) {
+      logger.log(`Tracking: dragX=${this._dragX}, dragY=${this._dragY}`);
+    }
+    const baseEyeBallX = this._model.getParameterValueById(this._idParamEyeBallX);
+    const baseEyeBallY = this._model.getParameterValueById(this._idParamEyeBallY);
+    this._model.setParameterValueById(this._idParamEyeBallX, baseEyeBallX + this._dragX * 0.5);
+    this._model.setParameterValueById(this._idParamEyeBallY, baseEyeBallY + this._dragY * 0.5);
+
+    // 呼吸など - チャット画面でも呼吸は有効にする
+    if (this._breath != null) {
+      this._breath.updateParameters(this._model, deltaTimeSeconds);
+    }
+
+    // 物理演算の設定 - チャット画面でも物理演算は有効にする
+    if (this._physics != null) {
+      this._physics.evaluate(this._model, deltaTimeSeconds);
+    }
+
+    // リップシンクの設定 - これは維持（リップシンクは必要）
+    if (this._lipsync) {
+      let value = 0.0; // リアルタイムでリップシンクを行う場合、システムから音量を取得して、0~1の範囲で値を入力します。
+
+      // 外部から設定された値を優先
+      if (this._lipSyncValue > 0) {
+        value = this._lipSyncValue;
+      } else {
+        // 従来のWAVファイルハンドラーを使用
+        this._wavFileHandler.update(deltaTimeSeconds);
+        value = this._wavFileHandler.getRms();
+      }
+
+      for (let i = 0; i < this._lipSyncIds.getSize(); ++i) {
+        // setParameterValueByIdを使用して直接値を設定（addは相対的な加算）
+        // 第3引数（weight）を1.0にして値をそのまま適用
+        this._model.setParameterValueById(this._lipSyncIds.at(i), value, 1.0);
+      }
+    }
+
+    // ポーズの設定
+    if (this._pose != null) {
+      this._pose.updateParameters(this._model, deltaTimeSeconds);
+    }
+
+    // 全てのパラメータ更新が完了してから状態を保存
+    this._model.saveParameters();
+
+    this._model.update();
+  }
+
+  /**
+   * マウス位置を設定する（ドラッグではなく単純な位置追従）
+   * @param x X座標
+   * @param y Y座標
+   */
+  public setMousePosition(x: number, y: number): void {
+    // ドラッグマネージャーに直接座標を設定
+    this._dragManager.set(x, y);
+    // デバッグ: 設定される値を確認
+    if (LAppDefine.DebugLogEnable) {
+      logger.log(`setMousePosition: x=${x}, y=${y}`);
+    }
+  }
+
+  /**
+   * マウスが画面外に出た時の処理
+   */
+  public resetMousePosition(): void {
+    this._dragManager.set(0, 0);
+    if (LAppDefine.DebugLogEnable) {
+      logger.log('Mouse position reset to center');
+    }
+  }
+
+  /**
+   * リップシンク値を設定する
+   * @param value リップシンク値（0.0〜1.0）
+   */
+  public setLipSyncValue(value: number): void {
+    this._lipSyncValue = value;
+  }
+
+  /**
+   * 動作無効化フラグを設定する
+   * @param disable 動作を無効化する場合はtrue
+   */
+  public setDisableMotions(disable: boolean): void {
+    this._disableMotions = disable;
+  }
+
+  /**
+   * 動作無効化フラグを取得する
+   * @return 動作無効化フラグ
+   */
+  public getDisableMotions(): boolean {
+    return this._disableMotions;
+  }
+
+  /**
+   * ドラッグ情報を設定する（旧メソッド、互換性のため残す）
+   * @param x X座標
+   * @param y Y座標
+   */
+  public setDragging(x: number, y: number): void {
+    this.setMousePosition(x, y);
+  }
+
+  /**
+   * 引数で指定したモーションの再生を開始する
+   * @param group モーショングループ名
+   * @param no グループ内の番号
+   * @param priority 優先度
+   * @param onFinishedMotionHandler モーション再生終了時に呼び出されるコールバック関数
+   * @return 開始したモーションの識別番号を返す。個別のモーションが終了したか否かを判定するisFinished()の引数で使用する。開始できない時は[-1]
+   */
+  public startMotion(
+    group: string,
+    no: number,
+    priority: number,
+    onFinishedMotionHandler?: FinishedMotionCallback,
+    onBeganMotionHandler?: BeganMotionCallback
+  ): CubismMotionQueueEntryHandle {
+    if (priority == LAppDefine.PriorityForce) {
+      this._motionManager.setReservePriority(priority);
+    } else if (!this._motionManager.reserveMotion(priority)) {
+      if (this._debugMode) {
+        LAppPal.printMessage("[APP]can't start motion.");
+      }
+      return InvalidMotionQueueEntryHandleValue;
+    }
+
+    const motionFileName = this._modelSetting.getMotionFileName(group, no);
+
+    // ex) idle_0
+    const name = `${group}_${no}`;
+    let motion: CubismMotion = this._motions.getValue(name) as CubismMotion;
+    let autoDelete = false;
+
+    if (motion == null) {
+      fetch(`${this._modelHomeDir}${motionFileName}`)
+        .then(response => {
+          if (response.ok) {
+            return response.arrayBuffer();
+          } else if (response.status >= 400) {
+            CubismLogError(
+              `Failed to load file ${this._modelHomeDir}${motionFileName}`
+            );
+            return new ArrayBuffer(0);
+          }
+        })
+        .then(arrayBuffer => {
+          motion = this.loadMotion(
+            arrayBuffer,
+            arrayBuffer.byteLength,
+            null,
+            onFinishedMotionHandler,
+            onBeganMotionHandler,
+            this._modelSetting,
+            group,
+            no,
+            this._motionConsistency
+          );
+        });
+
+      if (motion) {
+        motion.setEffectIds(this._eyeBlinkIds, this._lipSyncIds);
+        autoDelete = true; // 終了時にメモリから削除
+      } else {
+        CubismLogError("Can't start motion {0} .", motionFileName);
+        // ロードできなかったモーションのReservePriorityをリセットする
+        this._motionManager.setReservePriority(LAppDefine.PriorityNone);
+        return InvalidMotionQueueEntryHandleValue;
+      }
+    } else {
+      motion.setBeganMotionHandler(onBeganMotionHandler);
+      motion.setFinishedMotionHandler(onFinishedMotionHandler);
+    }
+
+    // 待機モーションの場合、ウェイトを大幅に下げてマウス追従の影響を強くする
+    if (group === LAppDefine.MotionGroupIdle) {
+      motion.setWeight(0.3); // 待機モーションの影響を30%に減らす（マウス追従を優先）
+    }
+
+    //voice
+    const voice = this._modelSetting.getMotionSoundFileName(group, no);
+    if (voice.localeCompare('') != 0) {
+      let path = voice;
+      path = this._modelHomeDir + path;
+      this._wavFileHandler.start(path);
+    }
+
+    if (this._debugMode) {
+      LAppPal.printMessage(`[APP]start motion: [${group}_${no}]`);
+    }
+    return this._motionManager.startMotionPriority(
+      motion,
+      autoDelete,
+      priority
+    );
+  }
+
+  /**
+   * ランダムに選ばれたモーションの再生を開始する。
+   * @param group モーショングループ名
+   * @param priority 優先度
+   * @param onFinishedMotionHandler モーション再生終了時に呼び出されるコールバック関数
+   * @return 開始したモーションの識別番号を返す。個別のモーションが終了したか否かを判定するisFinished()の引数で使用する。開始できない時は[-1]
+   */
+  public startRandomMotion(
+    group: string,
+    priority: number,
+    onFinishedMotionHandler?: FinishedMotionCallback,
+    onBeganMotionHandler?: BeganMotionCallback
+  ): CubismMotionQueueEntryHandle {
+    if (this._modelSetting.getMotionCount(group) == 0) {
+      return InvalidMotionQueueEntryHandleValue;
+    }
+
+    const no: number = Math.floor(
+      Math.random() * this._modelSetting.getMotionCount(group)
+    );
+
+    return this.startMotion(
+      group,
+      no,
+      priority,
+      onFinishedMotionHandler,
+      onBeganMotionHandler
+    );
+  }
+
+  /**
+   * 引数で指定した表情モーションをセットする
+   *
+   * @param expressionId 表情モーションのID
+   */
+  public setExpression(expressionId: string): void {
+    const motion: ACubismMotion = this._expressions.getValue(expressionId);
+
+    if (this._debugMode) {
+      LAppPal.printMessage(`[APP]expression: [${expressionId}]`);
+    }
+
+    if (motion != null) {
+      this._expressionManager.startMotion(motion, false);
+    } else {
+      if (this._debugMode) {
+        LAppPal.printMessage(`[APP]expression[${expressionId}] is null`);
+      }
+    }
+  }
+
+  /**
+   * ランダムに選ばれた表情モーションをセットする
+   */
+  public setRandomExpression(): void {
+    if (this._expressions.getSize() == 0) {
+      return;
+    }
+
+    const no: number = Math.floor(Math.random() * this._expressions.getSize());
+
+    for (let i = 0; i < this._expressions.getSize(); i++) {
+      if (i == no) {
+        const name: string = this._expressions._keyValues[i].first;
+        this.setExpression(name);
+        return;
+      }
+    }
+  }
+
+  /**
+   * イベントの発火を受け取る
+   */
+  public motionEventFired(eventValue: csmString): void {
+    CubismLogInfo('{0} is fired on LAppModel!!', eventValue.s);
+  }
+
+  /**
+   * 当たり判定テスト
+   * 指定ＩＤの頂点リストから矩形を計算し、座標をが矩形範囲内か判定する。
+   *
+   * @param hitArenaName  当たり判定をテストする対象のID
+   * @param x             判定を行うX座標
+   * @param y             判定を行うY座標
+   */
+  public hitTest(hitArenaName: string, x: number, y: number): boolean {
+    // 透明時は当たり判定無し。
+    if (this._opacity < 1) {
+      return false;
+    }
+
+    const count: number = this._modelSetting.getHitAreasCount();
+
+    for (let i = 0; i < count; i++) {
+      if (this._modelSetting.getHitAreaName(i) == hitArenaName) {
+        const drawId: CubismIdHandle = this._modelSetting.getHitAreaId(i);
+        return this.isHit(drawId, x, y);
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * モーションデータをグループ名から一括でロードする。
+   * モーションデータの名前は内部でModelSettingから取得する。
+   *
+   * @param group モーションデータのグループ名
+   */
+  public preLoadMotionGroup(group: string): void {
+    for (let i = 0; i < this._modelSetting.getMotionCount(group); i++) {
+      const motionFileName = this._modelSetting.getMotionFileName(group, i);
+
+      // ex) idle_0
+      const name = `${group}_${i}`;
+      if (this._debugMode) {
+        LAppPal.printMessage(
+          `[APP]load motion: ${motionFileName} => [${name}]`
+        );
+      }
+
+      // AbortControllerがない場合はスキップ
+      if (!this._abortController) {
+        logger.warn('AbortController not available, skipping motion load');
+        return;
+      }
+
+      fetch(`${this._modelHomeDir}${motionFileName}`, { signal: this._abortController.signal })
+        .then(response => {
+          // subdelegateがnullになっていないかチェック
+          if (!this._subdelegate) {
+            throw new Error('Subdelegate is null, cancelling motion load');
+          }
+          if (response.ok) {
+            return response.arrayBuffer();
+          } else if (response.status >= 400) {
+            CubismLogError(
+              `Failed to load file ${this._modelHomeDir}${motionFileName}`
+            );
+            return new ArrayBuffer(0);
+          }
+        })
+        .then(arrayBuffer => {
+          // subdelegateがnullになっていないかチェック
+          if (!this._subdelegate) {
+            throw new Error('Subdelegate is null, cancelling motion setup');
+          }
+          const tmpMotion: CubismMotion = this.loadMotion(
+            arrayBuffer,
+            arrayBuffer.byteLength,
+            name,
+            null,
+            null,
+            this._modelSetting,
+            group,
+            i,
+            this._motionConsistency
+          );
+
+          if (tmpMotion != null) {
+            tmpMotion.setEffectIds(this._eyeBlinkIds, this._lipSyncIds);
+
+            if (this._motions.getValue(name) != null) {
+              ACubismMotion.delete(this._motions.getValue(name));
+            }
+
+            this._motions.setValue(name, tmpMotion);
+
+            this._motionCount++;
+          } else {
+            // loadMotionできなかった場合はモーションの総数がずれるので1つ減らす
+            this._allMotionCount--;
+          }
+
+          if (this._motionCount >= this._allMotionCount) {
+            this._state = LoadStep.LoadTexture;
+
+            // 全てのモーションを停止する
+            this._motionManager.stopAllMotions();
+
+            this._updating = false;
+            this._initialized = true;
+
+            // subdelegateがまだ存在することを確認
+            if (this._subdelegate && this._subdelegate.getGlManager()) {
+              this.createRenderer();
+              this.setupTextures();
+              this.getRenderer().startUp(
+                this._subdelegate.getGlManager().getGl()
+              );
+            } else {
+              logger.warn('Subdelegate or GlManager not available for renderer startup, model loading cancelled');
+            }
+          }
+        })
+        .catch(error => {
+          // AbortErrorの場合はログを出さない
+          if (error.name !== 'AbortError' && error.message !== 'Subdelegate is null, cancelling motion load' && error.message !== 'Subdelegate is null, cancelling motion setup') {
+            logger.error('Failed to load motion:', error);
+          }
+        });
+    }
+  }
+
+  /**
+   * すべてのモーションデータを解放する。
+   */
+  public releaseMotions(): void {
+    this._motions.clear();
+  }
+
+  /**
+   * 全ての表情データを解放する。
+   */
+  public releaseExpressions(): void {
+    this._expressions.clear();
+  }
+
+  /**
+   * モデルを描画する処理。モデルを描画する空間のView-Projection行列を渡す。
+   */
+  public doDraw(): void {
+    if (this._model == null) return;
+
+    // キャンバスサイズを渡す
+    if (this._subdelegate) {
+      const canvas = this._subdelegate.getCanvas();
+      const viewport: number[] = [0, 0, canvas.width, canvas.height];
+
+      this.getRenderer().setRenderState(
+        this._subdelegate.getFrameBuffer(),
+        viewport
+      );
+    } else {
+      logger.error('Subdelegate not available for drawing');
+      return;
+    }
+    this.getRenderer().drawModel();
+  }
+
+  /**
+   * モデルを描画する処理。モデルを描画する空間のView-Projection行列を渡す。
+   */
+  public draw(matrix: CubismMatrix44): void {
+    if (this._model == null) {
+      return;
+    }
+
+    // 各読み込み終了後
+    if (this._state == LoadStep.CompleteSetup) {
+      matrix.multiplyByMatrix(this._modelMatrix);
+
+      this.getRenderer().setMvpMatrix(matrix);
+
+      this.doDraw();
+    }
+  }
+
+  public async hasMocConsistencyFromFile() {
+    CSM_ASSERT(this._modelSetting.getModelFileName().localeCompare(``));
+
+    // CubismModel
+    if (this._modelSetting.getModelFileName() != '') {
+      const modelFileName = this._modelSetting.getModelFileName();
+
+      const response = await fetch(`${this._modelHomeDir}${modelFileName}`);
+      const arrayBuffer = await response.arrayBuffer();
+
+      this._consistency = CubismMoc.hasMocConsistency(arrayBuffer);
+
+      if (!this._consistency) {
+        CubismLogInfo('Inconsistent MOC3.');
+      } else {
+        CubismLogInfo('Consistent MOC3.');
+      }
+
+      return this._consistency;
+    } else {
+      LAppPal.printMessage('Model data does not exist.');
+    }
+  }
+
+  public setSubdelegate(subdelegate: LAppSubdelegate): void {
+    this._subdelegate = subdelegate;
+    if (subdelegate) {
+      logger.log('LAppModel: subdelegate set successfully');
+      if (subdelegate.getTextureManager()) {
+        logger.log('LAppModel: TextureManager is available');
+      } else {
+        logger.warn('LAppModel: TextureManager is not available in subdelegate');
+      }
+    } else {
+      logger.warn('LAppModel: subdelegate is null');
+      // subdelegateがnullに設定されたら、進行中のロードをキャンセル
+      this.cancelLoading();
+    }
+  }
+
+  /**
+   * 進行中のロード処理をキャンセルする
+   */
+  public cancelLoading(): void {
+    if (this._abortController) {
+      this._abortController.abort();
+      this._abortController = null;
+    }
+  }
+
+  /**
+   * コンストラクタ
+   */
+  public constructor() {
+    super();
+
+    this._subdelegate = null;
+    this._modelSetting = null;
+    this._modelHomeDir = null;
+    this._userTimeSeconds = 0.0;
+    this._abortController = null;
+
+    this._eyeBlinkIds = new csmVector<CubismIdHandle>();
+    this._lipSyncIds = new csmVector<CubismIdHandle>();
+
+    this._motions = new csmMap<string, ACubismMotion>();
+    this._expressions = new csmMap<string, ACubismMotion>();
+
+    this._hitArea = new csmVector<csmRect>();
+    this._userArea = new csmVector<csmRect>();
+
+    this._idParamAngleX = CubismFramework.getIdManager().getId(
+      CubismDefaultParameterId.ParamAngleX
+    );
+    this._idParamAngleY = CubismFramework.getIdManager().getId(
+      CubismDefaultParameterId.ParamAngleY
+    );
+    this._idParamAngleZ = CubismFramework.getIdManager().getId(
+      CubismDefaultParameterId.ParamAngleZ
+    );
+    this._idParamEyeBallX = CubismFramework.getIdManager().getId(
+      CubismDefaultParameterId.ParamEyeBallX
+    );
+    this._idParamEyeBallY = CubismFramework.getIdManager().getId(
+      CubismDefaultParameterId.ParamEyeBallY
+    );
+    this._idParamBodyAngleX = CubismFramework.getIdManager().getId(
+      CubismDefaultParameterId.ParamBodyAngleX
+    );
+    this._idParamBodyAngleY = CubismFramework.getIdManager().getId(
+      CubismDefaultParameterId.ParamBodyAngleY
+    );
+    this._idParamBodyAngleZ = CubismFramework.getIdManager().getId(
+      CubismDefaultParameterId.ParamBodyAngleZ
+    );
+
+    if (LAppDefine.MOCConsistencyValidationEnable) {
+      this._mocConsistency = true;
+    }
+
+    if (LAppDefine.MotionConsistencyValidationEnable) {
+      this._motionConsistency = true;
+    }
+
+    this._state = LoadStep.LoadAssets;
+    this._expressionCount = 0;
+    this._textureCount = 0;
+    this._motionCount = 0;
+    this._allMotionCount = 0;
+    this._wavFileHandler = new LAppWavFileHandler();
+    this._consistency = false;
+
+    // Initialize natural motion controller
+    this._naturalMotionController = new NaturalMotionController();
+  }
+
+  private _subdelegate: LAppSubdelegate;
+  private _abortController: AbortController | null; // 非同期処理キャンセル用
+
+  _modelSetting: ICubismModelSetting; // モデルセッティング情報
+  _modelHomeDir: string; // モデルセッティングが置かれたディレクトリ
+  _userTimeSeconds: number; // デルタ時間の積算値[秒]
+
+  _eyeBlinkIds: csmVector<CubismIdHandle>; // モデルに設定された瞬き機能用パラメータID
+  _lipSyncIds: csmVector<CubismIdHandle>; // モデルに設定されたリップシンク機能用パラメータID
+
+  _motions: csmMap<string, ACubismMotion>; // 読み込まれているモーションのリスト
+  _expressions: csmMap<string, ACubismMotion>; // 読み込まれている表情のリスト
+
+  _hitArea: csmVector<csmRect>;
+  _userArea: csmVector<csmRect>;
+
+  _idParamAngleX: CubismIdHandle; // パラメータID: ParamAngleX
+  _idParamAngleY: CubismIdHandle; // パラメータID: ParamAngleY
+  _idParamAngleZ: CubismIdHandle; // パラメータID: ParamAngleZ
+  _idParamEyeBallX: CubismIdHandle; // パラメータID: ParamEyeBallX
+  _idParamEyeBallY: CubismIdHandle; // パラメータID: ParamEyeBAllY
+  _idParamBodyAngleX: CubismIdHandle; // パラメータID: ParamBodyAngleX
+  _idParamBodyAngleY: CubismIdHandle; // パラメータID: ParamBodyAngleY
+  _idParamBodyAngleZ: CubismIdHandle; // パラメータID: ParamBodyAngleZ
+
+  _state: LoadStep; // 現在のステータス管理用
+  _expressionCount: number; // 表情データカウント
+  _textureCount: number; // テクスチャカウント
+  _motionCount: number; // モーションデータカウント
+  _allMotionCount: number; // モーション総数
+  _wavFileHandler: LAppWavFileHandler; //wavファイルハンドラ
+  _consistency: boolean; // MOC3整合性チェック管理用
+  protected _lipSyncValue: number = 0.0; // リップシンク値（外部から設定可能）
+  private _disableMotions: boolean = false;
+
+  // Natural motion controller
+  private _naturalMotionController: NaturalMotionController;
+  private _dragSpeedX: number = 0; // Phase 2: Acceleration-based motion
+  private _dragSpeedY: number = 0; // Phase 2: Acceleration-based motion
+  private _lastBlinkTime: number = 0; // Phase 4: Blink timing
+}
