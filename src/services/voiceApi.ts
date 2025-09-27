@@ -1,5 +1,4 @@
 import axios, { AxiosError } from 'axios';
-import { decode as base64ToArrayBuffer } from 'base64-arraybuffer';
 import { logger } from '@/utils/logger';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000';
@@ -204,10 +203,17 @@ export class VoiceService {
             // AudioContextをクローズ
             await audioContext.close();
           } catch (decodeError) {
-            // AudioContextでのデコードに失敗した場合は、base64-arraybufferを使用
-            logger.log('VoiceService: AudioContextデコード失敗、base64-arraybufferを使用', decodeError);
+            // AudioContextでのデコードに失敗した場合は、手動でBase64をデコード
+            logger.log('VoiceService: AudioContextデコード失敗、手動Base64デコードを使用', decodeError);
 
-            const originalArrayBuffer = base64ToArrayBuffer(base64Data);
+            // Base64文字列をArrayBufferに変換（ネイティブ実装）
+            const binaryString = atob(base64Data);
+            const bytes = new Uint8Array(binaryString.length);
+            for (let i = 0; i < binaryString.length; i++) {
+              bytes[i] = binaryString.charCodeAt(i);
+            }
+            const originalArrayBuffer = bytes.buffer;
+
             const AudioContextClass = window.AudioContext || (window as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
             if (!AudioContextClass) {
               throw new Error('AudioContext not supported');

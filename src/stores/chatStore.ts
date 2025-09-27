@@ -9,7 +9,8 @@ interface ChatStore {
   isLoading: boolean;
   error: string | null;
   settings: ChatSettings;
-  
+  playingMessageId: string | null; // 現在再生中のメッセージID
+
   // Actions
   addMessage: (message: ChatMessage) => void;
   setMessages: (messages: ChatMessage[]) => void;
@@ -19,6 +20,7 @@ interface ChatStore {
   updateSettings: (settings: Partial<ChatSettings>) => void;
   clearMessages: () => void;
   newSession: () => void;
+  setPlayingMessageId: (messageId: string | null) => void; // 再生中のメッセージIDを設定
 }
 
 const defaultSettings: ChatSettings = {
@@ -38,6 +40,7 @@ export const useChatStore = create<ChatStore>()(
       isLoading: false,
       error: null,
       settings: defaultSettings,
+      playingMessageId: null,
 
       addMessage: (message) =>
         set((state) => ({
@@ -68,8 +71,12 @@ export const useChatStore = create<ChatStore>()(
         set({
           messages: [],
           sessionId: uuidv4(),
-          error: null
-        })
+          error: null,
+          playingMessageId: null
+        }),
+
+      setPlayingMessageId: (messageId) =>
+        set({ playingMessageId: messageId })
     }),
     {
       name: 'chat-storage',

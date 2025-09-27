@@ -144,7 +144,7 @@ export default function MyPage() {
               disabled={loading || !hasChanges}
               className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              {loading ? '更新中...' : !hasChanges ? '変更がありません' : 'プロフィールを更新'}
+              {loading ? '更新中...' : !hasChanges ? '変更' : 'プロフィールを更新'}
             </button>
           </form>
         </div>
