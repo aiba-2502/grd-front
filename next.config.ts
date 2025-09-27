@@ -2,10 +2,6 @@ import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   /* config options here */
-  // 実験的機能の有効化
-  experimental: {
-    optimizeCss: true, // CSS最適化
-  },
   // 画像の最適化
   images: {
     formats: ['image/avif', 'image/webp'],
